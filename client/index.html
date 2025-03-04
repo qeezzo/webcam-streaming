@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+    <head>
+        <meta charset="UTF-8" />
+        <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+        <title>WebRTC MJPEG Streaming</title>
+    </head>
+    <body>
+        <h1>WebRTC MJPEG Streaming</h1>
+
+        <label for="resolution">Select Resolution:</label>
+        <select id="resolution">
+            <option value="640x480">640x480</option>
+            <option value="1280x720" selected>1280x720</option>
+            <option value="1920x1080">1920x1080</option>
+        </select>
+
+        <button id="startButton">Start Streaming</button>
+
+        <video id="localVideo" autoplay playsinline></video>
+        <canvas id="canvas" style="display: none"></canvas>
+
+        <script src="script.js"></script>
+    </body>
+</html>
