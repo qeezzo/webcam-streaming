@@ -1,4 +1,5 @@
 const ws = new WebSocket("ws://10.81.90.2:3000");
+// const ws = new WebSocket("ws://localhost:3000");
 const pc = new RTCPeerConnection({
     iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
@@ -46,7 +47,21 @@ dataChannel.onclose = () => console.log("DataChannel closed");
 async function startCapture() {
     const [width, height] = resolutionSelect.value.split("x").map(Number);
     try {
-        videoStream = await navigator.mediaDevices.getUserMedia({ video: { mimeType: "image/jpeg", width, height } });
+        videoStream = await navigator.mediaDevices.getUserMedia({
+            video: {
+                mimeType: "image/jpeg",
+                width,
+                height
+            },
+            audio: {
+                codec: "opus",
+                sampleRate: 64000,
+                channelCount: 2,
+                autoGainControl: false,
+                echoCancellation: false,
+                noiseSuppression: false
+            }
+        });
         videoElement.srcObject = videoStream;
         console.log(`Camera access granted at ${width}x${height}`);
 
@@ -54,13 +69,23 @@ async function startCapture() {
         const capabilities = track.getCapabilities();
         console.log("Camera Capabilities:", capabilities);
 
+
+        // Audio track
+        const audioTrack = videoStream.getAudioTracks()[0];
+        if (audioTrack) {
+            pc.addTrack(audioTrack, videoStream);
+            console.log("Audio track added to WebRTC connection.");
+        } else {
+            console.warn("No audio track found.");
+        }
+
         // Create WebRTC Offer
         const offer = await pc.createOffer();
         await pc.setLocalDescription(offer);
         ws.send(JSON.stringify({ sdp: offer }));
 
     } catch (error) {
-        console.error("Error accessing camera:", error);
+        console.error("Error accessing camera/audio:", error);
     }
 }
 

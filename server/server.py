@@ -33,6 +33,7 @@ class WebRTCClient:
 
         self.last_frame_time = time.time()  # Last frame receive time (in seconds)
         self.frame_count = 0  # Counter for frames received in the current second
+        self.timestamp = 0
 
     def reset_pipeline(self):
         """Function to reset the pipeline when the client disconnects."""
@@ -59,7 +60,7 @@ class WebRTCClient:
             logging.info("pipeline reset successfully.")
 
     def prepare_data_channel(self, _, channel, is_local):
-        logging.info(f"preparing data channel... {"local" if is_local else "remote"}")
+        logging.info(f"preparing data channel... {'local' if is_local else 'remote'}")
         self.data_channel = channel
         self.data_channel.connect("on-message-data", self.on_data_channel_data)
         self.data_channel.connect("on-open", self.on_data_channel_open)
@@ -82,31 +83,19 @@ class WebRTCClient:
         self.reset_pipeline()
 
     def on_data_channel_data(self, _, data):
-        logging.info(f"data channel received -> {data.get_size()} bytes")
+        # logging.info(f"data channel received -> {data.get_size()} bytes")
 
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
 
-            now = Gst.Clock.get_time(Gst.SystemClock.obtain())
+            # fps = 30
 
-            # Calculate PTS based on frame count and FPS
-            if not hasattr(self, "base_time"):  # Initialize base time
-                self.base_time = now
-                self.count = 0
-
-            elapsed_time = now - self.base_time  # Time since start (nanoseconds)
-            fps = 30  # Adjust based on actual frame rate
-            frame_duration = Gst.NSECOND // fps  # Time per frame
-
-            # Set timestamps
-            buf.pts = elapsed_time  # Presentation timestamp
-            buf.dts = elapsed_time  # Decoding timestamp
-            buf.duration = frame_duration  # Duration of frame
+            # # Set timestamps
+            # buf.pts = self.timestamp
+            # buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, fps)
+            # self.timestamp += buf.duration
 
             self.appsrc.emit("push_buffer", buf)
-
-            # Increment frame counter
-            self.count += 1
 
         # Track frame rate calculation
         current_time = time.time()
@@ -185,26 +174,76 @@ class WebRTCClient:
         sdpmlineindex = ice["sdpMLineIndex"]
         self.webrtc.emit("add-ice-candidate", sdpmlineindex, candidate)
 
+    def on_incoming_decodebin_stream(self, _, pad):
+        if not pad.has_current_caps():
+            logging.warning("pad has no caps, skipping...")
+            return
+
+        # handle pad differently - audio/video
+        caps = pad.get_current_caps()
+        media_type = caps.get_structure(0).get_name()
+        if media_type.startswith("video"):
+            self.handle_video_stream(pad)
+        elif media_type.startswith("audio"):
+            self.handle_audio_stream(pad)
+        else:
+            logging.warning(f"unsupported media type: {media_type}")
+            return
+
     def on_incoming_stream(self, _, pad):
         logging.info("on_incoming_stream()")
 
         if pad.direction != Gst.PadDirection.SRC:
             return
 
-        queue = Gst.ElementFactory.make("queue")
-        sink = Gst.ElementFactory.make("autovideosink")
+        decodebin = Gst.ElementFactory.make("decodebin")
+        if not decodebin:
+            logging.error("decodebin creation failed")
+            return
 
-        self.pipe.add(queue, sink)
+        decodebin.connect("pad-added", self.on_incoming_decodebin_stream)
+        self.pipe.add(decodebin)
+        decodebin.sync_state_with_parent()
+        pad.link(decodebin.get_static_pad("sink"))
+
+    def handle_video_stream(self, pad):
+        """Shouldn't be any requests here. MJPEG streamed over raw data channel"""
+
+        logging.warning("received stream on generic webrtc input")
+
+    def handle_audio_stream(self, pad):
+        """Handle audio stream. Outputs direclty to an alsasink that is a UAC gadget"""
+
+        logging.info("audio stream received")
+        queue = Gst.ElementFactory.make("queue")
+        convert = Gst.ElementFactory.make("audioconvert")
+        resample = Gst.ElementFactory.make("audioresample")
+        rate = Gst.ElementFactory.make("audiorate")
+        sink = Gst.ElementFactory.make("autoaudiosink")
+
+        if not convert or not queue or not resample or not rate or not sink:
+            logging.error("failed to create audio elements")
+            return
+
+        sink.set_property("sync", False)
+
+        self.pipe.add(queue)
+        self.pipe.add(convert)
+        self.pipe.add(resample)
+        self.pipe.add(rate)
+        self.pipe.add(sink)
         self.pipe.sync_children_states()
 
-        if pad.has_current_caps():
-            caps = pad.get_current_caps()
-            assert len(caps)
-            logging.info(f"incoming stream caps -> {caps}")
-
-        # TODO: check kind of stream (video, audio)
         pad.link(queue.get_static_pad("sink"))
-        queue.link(sink)
+        queue.link(convert)
+        convert.link(resample)
+        convert.link(resample)
+        resample.link(rate)
+        rate.link(sink)
+
+        logging.info("audio pipeline linked successfully")
+
+        # Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline")
 
     def start_pipeline(self):
         logging.info("creating pipeline...")
@@ -220,6 +259,7 @@ class WebRTCClient:
         self.appsrc = Gst.ElementFactory.make("appsrc", "mjpeg_src")
         self.appsrc.set_property("format", Gst.Format.TIME)
         self.appsrc.set_property("block", True)
+        self.appsrc.set_property("do-timestamp", True)
 
         # mjpeg handling pipeline
         dec = Gst.ElementFactory.make("jpegdec")
