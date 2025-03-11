@@ -1,7 +1,7 @@
-const ws = new WebSocket("ws://10.81.90.2:3000");
-// const ws = new WebSocket("ws://localhost:3000");
+const ws = new WebSocket("ws://10.81.90.3:3000");
+// const ws = new WebSocket("ws://0.0.0.0:3000");
 const pc = new RTCPeerConnection({
-    iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    // iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });
 
 let dataChannel;
@@ -55,11 +55,6 @@ async function startCapture() {
             },
             audio: {
                 codec: "opus",
-                sampleRate: 64000,
-                channelCount: 2,
-                autoGainControl: false,
-                echoCancellation: false,
-                noiseSuppression: false
             }
         });
         videoElement.srcObject = videoStream;
@@ -111,8 +106,11 @@ function startSendingFrames() {
 
         // Send as MJPEG (if available)
         canvas.toBlob((blob) => {
+            if (dataChannel.readyState !== "open")
+                return;
+
+            // console.log(blob.size)
             dataChannel.send(blob);
-            // console.log('Frame sent -> ', blob.size);
 
             // Calculate FPS
             let now = performance.now(); // Get current time in milliseconds
@@ -125,7 +123,7 @@ function startSendingFrames() {
                 lastFrameTime = now; // Update last frame time
                 frameCount = 0;      // Reset frame count for the next second
             }
-        }, "image/jpeg", 0.8);
+        }, "image/jpeg", 0.4);
 
     }, frameInterval);  // Send a frame every "frameInterval" milliseconds (e.g., 33ms for 30 FPS)
 }

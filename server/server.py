@@ -1,10 +1,11 @@
 # python 3.11.2
 
 import websockets
+import websockets.server
 import logging
 import json
 import time
-from websockets.sync.server import serve
+import asyncio
 
 import gi
 
@@ -17,47 +18,23 @@ from gi.repository import GstWebRTC
 gi.require_version("GstSdp", "1.0")
 from gi.repository import GstSdp
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(levelname)s (%(filename)s:%(lineno)d) %(message)s",
-)
-
 
 class WebRTCClient:
-    def __init__(self, send_to_client):
+    def __init__(self, send_to_client, loop):
         self.pipe = None
         self.webrtc = None
         self.appsrc = None
-        self.send_to_client = send_to_client
         self.data_channel = None
 
-        self.last_frame_time = time.time()  # Last frame receive time (in seconds)
-        self.frame_count = 0  # Counter for frames received in the current second
+        self.event_loop = loop
+        self.send_to_client = send_to_client
+
+        self.last_frame_time = time.time()
+        self.frame_count = 0
         self.timestamp = 0
 
-    def reset_pipeline(self):
-        """Function to reset the pipeline when the client disconnects."""
-        if self.pipe:
-            logging.info("resetting the pipeline...")
-
-            # Set pipeline state to NULL to stop it
-            self.pipe.set_state(Gst.State.NULL)
-
-            # Remove elements from the pipeline
-            self.pipe.remove(self.webrtc)
-            if self.appsrc:
-                self.pipe.remove(self.appsrc)
-
-            # Clean up data channel connections and any other resources
-            if self.data_channel:
-                self.data_channel.close()
-                self.data_channel = None
-
-            # Clear out other elements if necessary
-            self.appsrc = None
-            self.webrtc = None
-            self.pipe = None
-            logging.info("pipeline reset successfully.")
+    def send_soon(self, msg):
+        asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
 
     def prepare_data_channel(self, _, channel, is_local):
         logging.info(f"preparing data channel... {'local' if is_local else 'remote'}")
@@ -80,21 +57,11 @@ class WebRTCClient:
 
     def on_data_channel_close(self, _):
         logging.info("data channel closed")
-        self.reset_pipeline()
 
     def on_data_channel_data(self, _, data):
-        # logging.info(f"data channel received -> {data.get_size()} bytes")
 
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
-
-            # fps = 30
-
-            # # Set timestamps
-            # buf.pts = self.timestamp
-            # buf.duration = Gst.util_uint64_scale_int(1, Gst.SECOND, fps)
-            # self.timestamp += buf.duration
-
             self.appsrc.emit("push_buffer", buf)
 
         # Track frame rate calculation
@@ -135,24 +102,31 @@ class WebRTCClient:
         icemsg = json.dumps(
             {"ice": {"candidate": candidate, "sdpMLineIndex": mlineindex}}
         )
-        self.send_to_client(icemsg)
+        self.send_soon(icemsg)
 
     def on_ice_gathering_state_notify(self, webrtc, _):
         state = webrtc.get_property("ice-gathering-state")
-        logging.info(f"ICE gathering state changed to {state.value_nick}")
+        logging.info(f"ICE GATHERING STATE -> {state.value_nick}")
+
+    def on_connection_state_notify(self, webrtc, _):
+        state = webrtc.get_property("connection-state")
+        logging.info(f"CONNECTION STATE -> {state.value_nick}")
+
+    def on_signaling_state_notify(self, webrtc, _):
+        state = webrtc.get_property("signaling-state")
+        logging.info(f"SIGNALING STATE -> {state.value_nick}")
 
     def on_answer_created(self, promise, _, __):
         logging.info("sending answer back to client...")
         assert promise.wait() == Gst.PromiseResult.REPLIED
         reply = promise.get_reply()
-        answer = reply.get_value("answer")  # python 3.11
-        # answer = reply["answer"]
+        answer = reply.get_value("answer")
         promise = Gst.Promise.new()
         self.webrtc.emit("set-local-description", answer, promise)
         promise.interrupt()  # we don't care about the result, discard it
         text = answer.sdp.as_text()
         msg = json.dumps({"sdp": {"type": "answer", "sdp": text}})
-        self.send_to_client(msg)
+        self.send_soon(msg)
 
     def on_offer_set(self, promise, _, __):
         assert promise.wait() == Gst.PromiseResult.REPLIED
@@ -179,7 +153,7 @@ class WebRTCClient:
             logging.warning("pad has no caps, skipping...")
             return
 
-        # handle pad differently - audio/video
+        # handles audio/video pads differently
         caps = pad.get_current_caps()
         media_type = caps.get_structure(0).get_name()
         if media_type.startswith("video"):
@@ -218,31 +192,29 @@ class WebRTCClient:
         queue = Gst.ElementFactory.make("queue")
         convert = Gst.ElementFactory.make("audioconvert")
         resample = Gst.ElementFactory.make("audioresample")
-        rate = Gst.ElementFactory.make("audiorate")
-        sink = Gst.ElementFactory.make("autoaudiosink")
+        sink = Gst.ElementFactory.make("alsasink")
 
-        if not convert or not queue or not resample or not rate or not sink:
+        if not queue or not convert or not resample or not sink:
             logging.error("failed to create audio elements")
             return
 
+        sink.set_property("device", "hw:UAC2Gadget")
         sink.set_property("sync", False)
 
         self.pipe.add(queue)
         self.pipe.add(convert)
         self.pipe.add(resample)
-        self.pipe.add(rate)
         self.pipe.add(sink)
         self.pipe.sync_children_states()
 
         pad.link(queue.get_static_pad("sink"))
         queue.link(convert)
         convert.link(resample)
-        convert.link(resample)
-        resample.link(rate)
-        rate.link(sink)
+        resample.link(sink)
 
         logging.info("audio pipeline linked successfully")
 
+        # debug purpose
         # Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline")
 
     def start_pipeline(self):
@@ -257,36 +229,43 @@ class WebRTCClient:
 
         # appsrc to receive mjpeg stream from raw data channel
         self.appsrc = Gst.ElementFactory.make("appsrc", "mjpeg_src")
-        self.appsrc.set_property("format", Gst.Format.TIME)
-        self.appsrc.set_property("block", True)
         self.appsrc.set_property("do-timestamp", True)
 
         # mjpeg handling pipeline
-        dec = Gst.ElementFactory.make("jpegdec")
-        conv = Gst.ElementFactory.make("videoconvert")
-        sink = Gst.ElementFactory.make("autovideosink")
+        parse = Gst.ElementFactory.make("jpegparse")
+        rate = Gst.ElementFactory.make("videorate")
+        sink = Gst.ElementFactory.make("uvcsink")
 
-        if not self.appsrc or not dec or not conv or not sink:
+        if not self.appsrc or not sink:
             logging.error("failed to create mjpeg handling pipeline")
+            return
+
+        # TODO: replace hardcoded device with actual UVC
+        v4l2sink = sink.get_child_by_name("v4l2sink")
+        v4l2sink.set_property("device", "/dev/video0")
 
         self.pipe.add(self.webrtc)
         self.pipe.add(self.appsrc)
-        self.pipe.add(dec)
-        self.pipe.add(conv)
+        self.pipe.add(parse)
+        self.pipe.add(rate)
         self.pipe.add(sink)
 
-        self.appsrc.link(dec)
-        dec.link(conv)
-        conv.link(sink)
+        self.appsrc.link(parse)
+        parse.link(rate)
+        rate.link(sink)
 
+        # TODO: consider to implement adaptive latency (jitterbuffer)
+        #       default is 200ms. (latency property of webrtcbin)
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
-        self.webrtc.connect(
-            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
-        )
         self.webrtc.connect("pad-added", self.on_incoming_stream)
         self.webrtc.connect("on-data-channel", self.on_data_channel)
         self.webrtc.connect("prepare-data-channel", self.prepare_data_channel)
+        self.webrtc.connect("notify::connection-state", self.on_connection_state_notify)
+        self.webrtc.connect("notify::signaling-state", self.on_signaling_state_notify)
+        self.webrtc.connect(
+            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
+        )
 
         # Attach bus logging
         bus = self.pipe.get_bus()
@@ -294,36 +273,61 @@ class WebRTCClient:
         bus.connect("message", self.on_bus_message)
 
         self.pipe.set_state(Gst.State.PLAYING)
+
+        # self.webrtc.emit(
+        #     "add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, None
+        # )
+
         logging.info("pipeline started successfully!")
 
 
-def signaling(websocket: websockets.server.ServerConnection):
+async def handle_disconnect(websocket: websockets.server.ServerConnection):
+    """Callback function to handle WebSocket disconnection."""
+    await websocket.wait_closed()
+    logging.info("handle_disconnect")
+
+
+async def signaling(websocket: websockets.server.ServerConnection):
     logging.info("client connected")
 
-    webrtc = WebRTCClient(websocket.send)
+    asyncio.create_task(handle_disconnect(websocket))
+
+    loop = asyncio.get_running_loop()
+
+    webrtc = WebRTCClient(websocket.send, loop)
     webrtc.start_pipeline()
 
-    for data in websocket:
-        logging.info(f"client -> {data}")
-        msg = json.loads(data)
+    try:
+        async for data in websocket:
+            max_length = 60
+            logging.info(
+                f"client -> {(data[:max_length] + '..') if len(data) > max_length else data}"
+            )
+            msg = json.loads(data)
 
-        if "sdp" in msg:
-            sdp = msg["sdp"]["sdp"]
-            webrtc.set_remote_description(sdp)
+            if "sdp" in msg:
+                sdp = msg["sdp"]["sdp"]
+                webrtc.set_remote_description(sdp)
 
-        elif "ice" in msg:
-            ice = msg["ice"]
-            webrtc.set_ice_candidate(ice)
-            pass
+            elif "ice" in msg:
+                ice = msg["ice"]
+                webrtc.set_ice_candidate(ice)
+                pass
+
+    except websockets.exceptions.ConnectionClosed:
+        logging.info("client connection closed unexpectedly.")
 
 
-def main():
+async def main():
     Gst.init(None)
 
-    with serve(signaling, "localhost", 3000) as server:
-        logging.info("server started on http://localhost:3000")
-        server.serve_forever()
+    async with websockets.serve(signaling, "0.0.0.0", 3000):
+        await asyncio.Future()
 
 
 if __name__ == "__main__":
-    main()
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(levelname)s (%(filename)s:%(lineno)d) %(message)s",
+    )
+    asyncio.run(main())
