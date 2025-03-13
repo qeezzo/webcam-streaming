@@ -15,6 +15,6 @@ python --version        # should be 3.11.2
 
 Handle dependencies for the project. Python _venv_ is preferable.
 ```shell
-python -m venv env
+python -m venv env --clear
 pip install -r requirements.txt
 ```

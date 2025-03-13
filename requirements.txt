@@ -1,2 +1,2 @@
-websockets
-PyGObject
+websockets==15.0.0
+PyGObject==3.50.0
