@@ -6,7 +6,6 @@ const pc = new RTCPeerConnection({
 
 let dataChannel;
 let videoStream;
-let sendFrameStopEvent = true;
 const videoElement = document.getElementById("localVideo");
 const canvas = document.getElementById("canvas");
 const ctx = canvas.getContext("2d");
@@ -84,63 +83,48 @@ async function startCapture() {
     }
 }
 
-let frameIntervalId;  // Store the interval reference to clear it later
-let frameInterval = 1000 / 30; // Frame interval for 30 FPS
-let lastFrameTime = 0;  // Last time a frame was sent (in ms)
-let frameCount = 0;     // Counter for frames sent in the current second
+let sendFrameStopEvent = true; // Flag to control start/stop of streaming
+let lastFrameTime = 0;
+let frameCount = 0;
+const targetFPS = 30;
+const frameInterval = 1000 / targetFPS;
+console.log(frameInterval);
 
-// Send Frames with Controlled FPS (Handles MJPEG & Raw Automatically)
-function startSendingFrames() {
-    frameIntervalId = setInterval(() => {
-        if (sendFrameStopEvent)
-            return;
+function sendFrame(timestamp) {
+    const elapsedTime = timestamp - lastFrameTime;
 
-        if (!videoElement.videoWidth || !videoElement.videoHeight) return;
-
-        // Set canvas size
+    if (elapsedTime >= frameInterval) {
+        // Proceed with sending the frame
         canvas.width = videoElement.videoWidth;
         canvas.height = videoElement.videoHeight;
-
-        // Draw the current frame onto the canvas
         ctx.drawImage(videoElement, 0, 0, canvas.width, canvas.height);
-
-        // Send as MJPEG (if available)
         canvas.toBlob((blob) => {
-            if (dataChannel.readyState !== "open")
-                return;
-
-            // console.log(blob.size)
+            if (dataChannel.readyState !== "open") return;
             dataChannel.send(blob);
-
-            // Calculate FPS
-            let now = performance.now(); // Get current time in milliseconds
-            frameCount++;
-
-            // If more than 1 second has passed, log FPS
-            if (now - lastFrameTime >= 1000) {
-                let actualFPS = frameCount;
-                console.log(`Actual FPS: ${actualFPS}`);
-                lastFrameTime = now; // Update last frame time
-                frameCount = 0;      // Reset frame count for the next second
-            }
         }, "image/jpeg", 0.4);
 
-    }, frameInterval);  // Send a frame every "frameInterval" milliseconds (e.g., 33ms for 30 FPS)
-}
+        // Log FPS for diagnostic purposes
+        frameCount++;
+        if (elapsedTime >= 1000) {
+            console.log(`FPS: ${frameCount}`);
+            frameCount = 0;
+            lastFrameTime = timestamp;
+        }
+    }
 
-// Stop sending frames
-function stopSendingFrames() {
-    clearInterval(frameIntervalId);
+    // Continue calling the function for the next frame
+    requestAnimationFrame(sendFrame);
 }
 
 // Start streaming when button is clicked
 startButton.addEventListener("click", () => {
-    sendFrameStopEvent = !sendFrameStopEvent;
+    sendFrameStopEvent = !sendFrameStopEvent;  // Toggle the flag
     startButton.textContent = sendFrameStopEvent ? "Start Streaming" : "Stop Streaming";
+
     if (!sendFrameStopEvent) {
-        startSendingFrames();  // Begin sending frames when streaming starts
+        sendFrame();  // Begin sending frames when streaming starts
     } else {
-        stopSendingFrames();   // Stop sending frames when streaming stops
+        cancelAnimationFrame(frameRequestId); // Stop the animation frame when streaming stops
     }
 });
 

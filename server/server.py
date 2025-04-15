@@ -59,7 +59,7 @@ class WebRTCClient:
         logging.info("data channel closed")
 
     def on_data_channel_data(self, _, data):
-
+        logging.info("Call -> on_data_channel_data()")
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
             self.appsrc.emit("push_buffer", buf)
@@ -76,6 +76,7 @@ class WebRTCClient:
             self.frame_count = 0  # Reset frame count for the next second
 
     def on_bus_message(self, bus, message):
+        logging.info("Call -> on_bus_message()")
         t = message.type
         if t == Gst.MessageType.ERROR:
             err, debug = message.parse_error()
@@ -117,6 +118,7 @@ class WebRTCClient:
         logging.info(f"SIGNALING STATE -> {state.value_nick}")
 
     def on_answer_created(self, promise, _, __):
+        logging.info("Call -> on_answer_created()")
         logging.info("sending answer back to client...")
         assert promise.wait() == Gst.PromiseResult.REPLIED
         reply = promise.get_reply()
@@ -129,11 +131,13 @@ class WebRTCClient:
         self.send_soon(msg)
 
     def on_offer_set(self, promise, _, __):
+        logging.info("Call -> on_offer_set()")
         assert promise.wait() == Gst.PromiseResult.REPLIED
         promise = Gst.Promise.new_with_change_func(self.on_answer_created, None, None)
         self.webrtc.emit("create-answer", None, promise)
 
     def set_remote_description(self, sdp):
+        logging.info("Call -> set_remote_description()")
         logging.info("setting remote description...")
         res, sdpmsg = GstSdp.SDPMessage.new_from_text(sdp)
         offer = GstWebRTC.WebRTCSessionDescription.new(
@@ -143,12 +147,14 @@ class WebRTCClient:
         self.webrtc.emit("set-remote-description", offer, promise)
 
     def set_ice_candidate(self, ice):
+        logging.info("Call -> set_ice_candidate()")
         logging.info("setting ice candidate...")
         candidate = ice["candidate"]
         sdpmlineindex = ice["sdpMLineIndex"]
         self.webrtc.emit("add-ice-candidate", sdpmlineindex, candidate)
 
     def on_incoming_decodebin_stream(self, _, pad):
+        logging.info("Call -> on_incoming_decodebin_stream()")
         if not pad.has_current_caps():
             logging.warning("pad has no caps, skipping...")
             return
@@ -165,7 +171,7 @@ class WebRTCClient:
             return
 
     def on_incoming_stream(self, _, pad):
-        logging.info("on_incoming_stream()")
+        logging.info("Call -> on_incoming_stream()")
 
         if pad.direction != Gst.PadDirection.SRC:
             return
@@ -181,36 +187,32 @@ class WebRTCClient:
         pad.link(decodebin.get_static_pad("sink"))
 
     def handle_video_stream(self, pad):
+        logging.info("Call -> handle_video_stream()")
         """Shouldn't be any requests here. MJPEG streamed over raw data channel"""
 
         logging.warning("received stream on generic webrtc input")
 
     def handle_audio_stream(self, pad):
+        logging.info("Call -> handle_audio_stream()")
         """Handle audio stream. Outputs direclty to an alsasink that is a UAC gadget"""
 
         logging.info("audio stream received")
-        queue = Gst.ElementFactory.make("queue")
         convert = Gst.ElementFactory.make("audioconvert")
-        resample = Gst.ElementFactory.make("audioresample")
         sink = Gst.ElementFactory.make("alsasink")
 
-        if not queue or not convert or not resample or not sink:
+        if not convert or not sink:
             logging.error("failed to create audio elements")
             return
 
         sink.set_property("device", "hw:UAC2Gadget")
         sink.set_property("sync", False)
 
-        self.pipe.add(queue)
         self.pipe.add(convert)
-        self.pipe.add(resample)
         self.pipe.add(sink)
         self.pipe.sync_children_states()
 
-        pad.link(queue.get_static_pad("sink"))
-        queue.link(convert)
-        convert.link(resample)
-        resample.link(sink)
+        pad.link(convert.get_static_pad("sink"))
+        convert.link(sink)
 
         logging.info("audio pipeline linked successfully")
 
@@ -218,6 +220,7 @@ class WebRTCClient:
         # Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline")
 
     def start_pipeline(self):
+        logging.info("Call -> start_pipeline()")
         logging.info("creating pipeline...")
 
         self.pipe = Gst.Pipeline.new("webrtc-pipeline")
@@ -227,35 +230,37 @@ class WebRTCClient:
             logging.error("failed to create webrtc pipeline")
             return
 
-        # appsrc to receive mjpeg stream from raw data channel
-        self.appsrc = Gst.ElementFactory.make("appsrc", "mjpeg_src")
-        self.appsrc.set_property("do-timestamp", True)
+        # # appsrc to receive mjpeg stream from raw data channel
+        # self.appsrc = Gst.ElementFactory.make("appsrc", "mjpeg_src")
+        # self.appsrc.set_property("do-timestamp", True)
 
-        # mjpeg handling pipeline
-        parse = Gst.ElementFactory.make("jpegparse")
-        rate = Gst.ElementFactory.make("videorate")
-        sink = Gst.ElementFactory.make("uvcsink")
+        # # mjpeg handling pipeline
+        # parse = Gst.ElementFactory.make("jpegparse")
+        # rate = Gst.ElementFactory.make("videorate")
+        # sink = Gst.ElementFactory.make("uvcsink")
 
-        if not self.appsrc or not sink:
-            logging.error("failed to create mjpeg handling pipeline")
-            return
+        # if not self.appsrc or not sink:
+        #     logging.error("failed to create mjpeg handling pipeline")
+        #     return
 
-        # TODO: replace hardcoded device with actual UVC
-        v4l2sink = sink.get_child_by_name("v4l2sink")
-        v4l2sink.set_property("device", "/dev/video0")
+        # # TODO: replace hardcoded device with actual UVC
+        # v4l2sink = sink.get_child_by_name("v4l2sink")
+        # v4l2sink.set_property("device", "/dev/video0")
 
         self.pipe.add(self.webrtc)
-        self.pipe.add(self.appsrc)
-        self.pipe.add(parse)
-        self.pipe.add(rate)
-        self.pipe.add(sink)
+        # self.pipe.add(self.appsrc)
+        # self.pipe.add(parse)
+        # self.pipe.add(rate)
+        # self.pipe.add(sink)
 
-        self.appsrc.link(parse)
-        parse.link(rate)
-        rate.link(sink)
+        # self.appsrc.link(parse)
+        # parse.link(rate)
+        # rate.link(sink)
 
         # TODO: consider to implement adaptive latency (jitterbuffer)
         #       default is 200ms. (latency property of webrtcbin)
+        self.webrtc.set_property("latency", 50)
+
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
         self.webrtc.connect("pad-added", self.on_incoming_stream)
@@ -281,13 +286,16 @@ class WebRTCClient:
         logging.info("pipeline started successfully!")
 
 
+# TODO: Handle properly destruction of webrtcclient
 async def handle_disconnect(websocket: websockets.server.ServerConnection):
+    logging.info("Call -> handle_disconnect()")
     """Callback function to handle WebSocket disconnection."""
     await websocket.wait_closed()
     logging.info("handle_disconnect")
 
 
 async def signaling(websocket: websockets.server.ServerConnection):
+    logging.info("Call -> signaling()")
     logging.info("client connected")
 
     asyncio.create_task(handle_disconnect(websocket))
@@ -307,6 +315,7 @@ async def signaling(websocket: websockets.server.ServerConnection):
 
             if "sdp" in msg:
                 sdp = msg["sdp"]["sdp"]
+                logging.info(f"SDP Offer: {json.dumps(sdp)}")
                 webrtc.set_remote_description(sdp)
 
             elif "ice" in msg:
@@ -319,6 +328,7 @@ async def signaling(websocket: websockets.server.ServerConnection):
 
 
 async def main():
+    logging.info("Call -> main()")
     Gst.init(None)
 
     async with websockets.serve(signaling, "0.0.0.0", 3000):
