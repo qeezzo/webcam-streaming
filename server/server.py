@@ -8,6 +8,7 @@ import time
 import asyncio
 
 import gi
+import dis
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -283,6 +284,7 @@ class WebRTCClient:
         #     "add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, None
         # )
 
+        # Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline")
         logging.info("pipeline started successfully!")
 
 
@@ -314,12 +316,13 @@ async def signaling(websocket: websockets.server.ServerConnection):
             msg = json.loads(data)
 
             if "sdp" in msg:
-                sdp = msg["sdp"]["sdp"]
+                sdp = msg["sdp"]
                 logging.info(f"SDP Offer: {json.dumps(sdp)}")
                 webrtc.set_remote_description(sdp)
 
             elif "ice" in msg:
                 ice = msg["ice"]
+                logging.info(f"ICE Candidate: {json.dumps(ice)}")
                 webrtc.set_ice_candidate(ice)
                 pass
 
