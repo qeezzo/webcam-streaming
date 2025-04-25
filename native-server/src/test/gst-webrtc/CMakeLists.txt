@@ -1,0 +1,10 @@
+add_executable(gst-webrtc-test gst-webrtc-test.cpp)
+
+find_package(PkgConfig)
+if (PKG_CONFIG_FOUND)
+    pkg_check_modules(GST REQUIRED glib-2.0 gstreamer-1.0 gstreamer-sdp-1.0 gstreamer-webrtc-1.0)
+    if (GST_FOUND)
+        target_link_libraries(gst-webrtc-test ${GST_LIBRARIES})
+        add_definitions(${GST_CFLAGS} ${GST_CFLAGS_OTHER})
+    endif()
+endif()
