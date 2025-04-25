@@ -22,7 +22,11 @@ void sigint_handler(int sig) {
 
 void handle_incomming_message(const std::string& message) {
     json json_msg = json::parse(message);
-    std::cout << json_msg.dump(4) << std::endl;
+    if (json_msg["sdp"] != nullptr) {
+        lwsl_user("Accepting SDP Offer: %s\n", message.data());
+    } else if (json_msg["ice"] != nullptr) {
+        lwsl_user("Accepting ICE Candidate: %s\n", message.data());
+    }
 }
 
 int callback_echo(struct lws* wsi, enum lws_callback_reasons reason, void* user, void* in, size_t len) {
@@ -32,7 +36,6 @@ int callback_echo(struct lws* wsi, enum lws_callback_reasons reason, void* user,
         case LWS_CALLBACK_RECEIVE:
             message += std::string(static_cast<const char*>(in), len);
             if (lws_is_final_fragment(wsi) != 0) {
-                lwsl_user("Received: (%d-%llu)%s\n", lws_is_final_fragment(wsi), message.size(), message.data());
                 handle_incomming_message(message);
                 message.resize(0);
             }
