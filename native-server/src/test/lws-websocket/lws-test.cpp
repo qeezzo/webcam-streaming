@@ -1,11 +1,16 @@
 #include <libwebsockets.h>
 #include <signal.h>
 
+#include <nlohmann/json.hpp>
+
 #include <iostream>
 #include <string>
 
-static int interrupted = 0;
+using json = nlohmann::json;
 
+int callback_echo(struct lws* wsi, enum lws_callback_reasons reason, void* user, void* in, size_t len);
+
+static int interrupted = 0;
 static struct lws_protocols protocols[] = {
     {"ws", callback_echo, 0, 0},
     {NULL, NULL, 0, 0}
@@ -16,7 +21,8 @@ void sigint_handler(int sig) {
 }
 
 void handle_incomming_message(const std::string& message) {
-    
+    json json_msg = json::parse(message);
+    std::cout << json_msg.dump(4) << std::endl;
 }
 
 int callback_echo(struct lws* wsi, enum lws_callback_reasons reason, void* user, void* in, size_t len) {
