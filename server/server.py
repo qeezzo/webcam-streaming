@@ -7,6 +7,7 @@ import json
 import time
 import asyncio
 import ssl
+import pyudev
 
 import gi
 
@@ -332,7 +333,7 @@ class WebRTCClient:
 
         # TODO: replace hardcoded device with actual UVC
         v4l2sink = sink.get_child_by_name("v4l2sink")
-        v4l2sink.set_property("device", "/dev/video0")
+        v4l2sink.set_property("device", get_uvc_gadget_video_device())
         v4l2sink.set_property("sync", False)
         v4l2sink.set_property("async", False)
         v4l2sink.set_property("max_lateness", 0)
@@ -381,6 +382,13 @@ class WebRTCClient:
 
         logging.info("pipeline started successfully!")
 
+def get_uvc_gadget_video_device():
+    context = pyudev.Context()
+    for device in context.list_devices(subsystem='video4linux'):
+        parent = device.find_parent('usb')
+        if parent and 'fe980000.usb' in parent.sys_path:
+            return device.device_node  # e.g. /dev/video0
+    raise RuntimeError("UVC gadget video device not found.")
 
 async def handle_disconnect(websocket: websockets.server.ServerConnection):
     """Callback function to handle WebSocket disconnection."""
