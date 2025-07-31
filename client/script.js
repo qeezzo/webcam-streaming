@@ -1,5 +1,6 @@
-const ws = new WebSocket("ws://10.81.90.3:3000");
+// const ws = new WebSocket("ws://10.81.90.3:3000");
 // const ws = new WebSocket("ws://0.0.0.0:3000");
+const ws = new WebSocket("ws://192.168.1.168:3000");
 const pc = new RTCPeerConnection({
     // iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
 });

@@ -6,6 +6,7 @@ import logging
 import json
 import time
 import asyncio
+import ssl
 
 import gi
 
@@ -17,6 +18,9 @@ from gi.repository import GstWebRTC
 
 gi.require_version("GstSdp", "1.0")
 from gi.repository import GstSdp
+
+gi.require_version("GstApp", "1.0")
+from gi.repository import GstApp
 
 
 class WebRTCClient:
@@ -32,6 +36,27 @@ class WebRTCClient:
         self.last_frame_time = time.time()
         self.frame_count = 0
         self.timestamp = 0
+
+    def cleanup(self):
+        """Clean up resources when client disconnects"""
+        logging.info("Cleaning up WebRTC client resources")
+
+        if self.pipe:
+            # EOS to the pipeline
+            self.pipe.send_event(Gst.Event.new_eos())
+
+            # Wait for EOS to propagate
+            bus = self.pipe.get_bus()
+            if bus:
+                bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS)
+
+            self.pipe.set_state(Gst.State.NULL)
+            self.pipe = None
+
+        self.webrtc = None
+        self.appsrc = None
+        self.data_channel = None
+        self.is_active = False
 
     def send_soon(self, msg):
         asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
@@ -62,7 +87,36 @@ class WebRTCClient:
 
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
+
+            print("len -> ", len(data.get_data()))
+
+            # Use wall clock time for both audio and video synchronization
+            # timestamp = int(time.time() * Gst.SECOND)  # Current time in nanoseconds
+            # buf.pts = timestamp
+            # buf.duration = int((1 / 30) * Gst.SECOND)  # Default to 30fps
+
+            # Calculate duration based on actual frame rate
+            # if self.frame_count > 0:  # After first frame
+            #     now = time.time()
+            #     elapsed = now - self.last_frame_time
+            #     avg_frame_duration = elapsed / self.frame_count
+            #     buf.duration = int(avg_frame_duration * Gst.SECOND)
+            # else:
+
+            # clock = self.pipe.get_clock()
+            # if clock:
+            #     running_time = clock.get_time() - self.pipe.get_base_time()
+            #     buf.pts = running_time
+            #     buf.duration = Gst.CLOCK_TIME_NONE
+
+            # timestamp = Gst.util_uint64_scale(int(time.time() * Gst.SECOND), 1, 1)
+            # buf.pts = timestamp
+            # buf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 30)
+
             self.appsrc.emit("push_buffer", buf)
+
+            # value_appsrc = self.appsrc.get_property("current-level-buffers")
+            # logging.info(f"APPSRC BUFFERS -> {value_appsrc}")
 
         # Track frame rate calculation
         current_time = time.time()
@@ -103,6 +157,11 @@ class WebRTCClient:
             {"ice": {"candidate": candidate, "sdpMLineIndex": mlineindex}}
         )
         self.send_soon(icemsg)
+
+    def on_queue_current_level_buffers(self, queue, _):
+        value = queue.get_property("current-level-buffers")
+        if value > 10:
+            logging.info(f"QUEUE BUFFERS -> {value}")
 
     def on_ice_gathering_state_notify(self, webrtc, _):
         state = webrtc.get_property("ice-gathering-state")
@@ -164,6 +223,9 @@ class WebRTCClient:
             logging.warning(f"unsupported media type: {media_type}")
             return
 
+    def on_stream_disconnect(self, _, pad):
+        logging.info("on_stream_disconnect()")
+
     def on_incoming_stream(self, _, pad):
         logging.info("on_incoming_stream()")
 
@@ -199,7 +261,17 @@ class WebRTCClient:
             return
 
         sink.set_property("device", "hw:UAC2Gadget")
-        sink.set_property("sync", False)
+        sink.set_property("sync", False)  # Crucial for low latency
+        sink.set_property("async", False)
+        sink.set_property("buffer-time", 20000)  # 20ms buffer (microseconds)
+        sink.set_property("latency-time", 20000)  # 20ms latency
+
+        queue.set_property("notify-levels", True)
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 10)
+        queue.connect(
+            "notify::current-level-buffers", self.on_queue_current_level_buffers
+        )
 
         self.pipe.add(queue)
         self.pipe.add(convert)
@@ -230,11 +302,29 @@ class WebRTCClient:
         # appsrc to receive mjpeg stream from raw data channel
         self.appsrc = Gst.ElementFactory.make("appsrc", "mjpeg_src")
         self.appsrc.set_property("do-timestamp", True)
+        self.appsrc.set_property("format", Gst.Format.TIME)
+        self.appsrc.set_property("is-live", True)
+        # self.appsrc.set_property("block", True)
+        # self.appsrc.set_property("max-latency", 10)
+        # self.appsrc.set_property("min-latency", 0)
+        self.appsrc.set_property("max-buffers", 5)
+        self.appsrc.set_property("leaky-type", GstApp.AppLeakyType.DOWNSTREAM)
 
         # mjpeg handling pipeline
+        queue = Gst.ElementFactory.make("queue")
         parse = Gst.ElementFactory.make("jpegparse")
         rate = Gst.ElementFactory.make("videorate")
         sink = Gst.ElementFactory.make("uvcsink")
+
+        # rate.set_property("max-rate", 0)
+        rate.set_property("drop-only", True)
+        rate.set_property("skip-to-first", True)
+        self.rate = rate
+
+        queue.set_property("notify-levels", True)
+        queue.set_property("leaky", 2)
+        queue.set_property("max-size-buffers", 50)
+        # queue.connect("notify::current-level-buffers", self.on_queue_current_level_buffers)
 
         if not self.appsrc or not sink:
             logging.error("failed to create mjpeg handling pipeline")
@@ -243,22 +333,30 @@ class WebRTCClient:
         # TODO: replace hardcoded device with actual UVC
         v4l2sink = sink.get_child_by_name("v4l2sink")
         v4l2sink.set_property("device", "/dev/video0")
+        v4l2sink.set_property("sync", False)
+        v4l2sink.set_property("async", False)
+        v4l2sink.set_property("max_lateness", 0)
+        v4l2sink.set_property("processing_deadline", 0)
+
+        self.v4l2sink = v4l2sink
 
         self.pipe.add(self.webrtc)
         self.pipe.add(self.appsrc)
+        self.pipe.add(queue)
         self.pipe.add(parse)
         self.pipe.add(rate)
         self.pipe.add(sink)
 
-        self.appsrc.link(parse)
+        self.appsrc.link(queue)
+        queue.link(parse)
         parse.link(rate)
         rate.link(sink)
 
-        # TODO: consider to implement adaptive latency (jitterbuffer)
-        #       default is 200ms. (latency property of webrtcbin)
+        self.webrtc.connect("pad-added", self.on_incoming_stream)
+        self.webrtc.connect("pad-removed", self.on_stream_disconnect)
+
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
-        self.webrtc.connect("pad-added", self.on_incoming_stream)
         self.webrtc.connect("on-data-channel", self.on_data_channel)
         self.webrtc.connect("prepare-data-channel", self.prepare_data_channel)
         self.webrtc.connect("notify::connection-state", self.on_connection_state_notify)
@@ -266,6 +364,9 @@ class WebRTCClient:
         self.webrtc.connect(
             "notify::ice-gathering-state", self.on_ice_gathering_state_notify
         )
+
+        # jitterbuffer latency indeed
+        self.webrtc.set_property("latency", 0)
 
         # Attach bus logging
         bus = self.pipe.get_bus()
@@ -299,10 +400,7 @@ async def signaling(websocket: websockets.server.ServerConnection):
 
     try:
         async for data in websocket:
-            max_length = 60
-            logging.info(
-                f"client -> {(data[:max_length] + '..') if len(data) > max_length else data}"
-            )
+            logging.info(f"client -> {data}")
             msg = json.loads(data)
 
             if "sdp" in msg:
@@ -321,7 +419,21 @@ async def signaling(websocket: websockets.server.ServerConnection):
 async def main():
     Gst.init(None)
 
-    async with websockets.serve(signaling, "0.0.0.0", 3000):
+    # SSL Configuration using existing PiKVM certificates
+    ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ssl_context.load_cert_chain(
+        certfile="/etc/kvmd/nginx/ssl/server.crt",
+        keyfile="/etc/kvmd/nginx/ssl/server.key",
+    )
+
+    # Security hardening (recommended)
+    ssl_context.minimum_version = ssl.TLSVersion.TLSv1_2
+    ssl_context.set_ciphers("ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384")
+    ssl_context.options |= (
+        ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
+    )
+
+    async with websockets.serve(signaling, "0.0.0.0", 3000, ssl=ssl_context):
         await asyncio.Future()
 
 
