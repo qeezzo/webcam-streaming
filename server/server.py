@@ -7,7 +7,9 @@ import json
 import time
 import asyncio
 import ssl
-import pyudev
+# import pyudev
+import os
+import glob
 
 import gi
 
@@ -381,12 +383,18 @@ class WebRTCClient:
 
         logging.info("pipeline started successfully!")
 
-def get_uvc_gadget_video_device():
-    context = pyudev.Context()
-    for device in context.list_devices(subsystem='video4linux2'):
-        parent = device.find_parent('usb')
-        if parent and 'fe980000.usb' in parent.sys_path:
-            return device.device_node  # e.g. /dev/video0
+def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
+    for device_path in glob.glob('/sys/class/video4linux/video*'):
+        # Get the real path to resolve symbolic links
+        real_path = os.path.realpath(device_path)
+        if usb_path in real_path:
+            return "/dev/" + os.path.basename(device_path) # e.g. /dev/video0
+
+    # context = pyudev.Context()
+    # for device in context.list_devices(subsystem='video4linux'):
+    #     parent = device.find_parent('usb')
+    #     if parent and 'fe980000.usb' in parent.sys_path:
+    #         return device.device_node  # e.g. /dev/video0
     raise RuntimeError("UVC gadget video device not found.")
 
 async def handle_disconnect(websocket: websockets.server.ServerConnection):
