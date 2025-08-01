@@ -331,7 +331,6 @@ class WebRTCClient:
             logging.error("failed to create mjpeg handling pipeline")
             return
 
-        # TODO: replace hardcoded device with actual UVC
         v4l2sink = sink.get_child_by_name("v4l2sink")
         v4l2sink.set_property("device", get_uvc_gadget_video_device())
         v4l2sink.set_property("sync", False)
@@ -384,7 +383,7 @@ class WebRTCClient:
 
 def get_uvc_gadget_video_device():
     context = pyudev.Context()
-    for device in context.list_devices(subsystem='video4linux'):
+    for device in context.list_devices(subsystem='video4linux2'):
         parent = device.find_parent('usb')
         if parent and 'fe980000.usb' in parent.sys_path:
             return device.device_node  # e.g. /dev/video0
