@@ -7,7 +7,6 @@ import json
 import time
 import asyncio
 import ssl
-# import pyudev
 import os
 import glob
 
@@ -307,56 +306,83 @@ class WebRTCClient:
         self.appsrc.set_property("do-timestamp", True)
         self.appsrc.set_property("format", Gst.Format.TIME)
         self.appsrc.set_property("is-live", True)
-        # self.appsrc.set_property("block", True)
-        # self.appsrc.set_property("max-latency", 10)
-        # self.appsrc.set_property("min-latency", 0)
         self.appsrc.set_property("max-buffers", 5)
         self.appsrc.set_property("leaky-type", GstApp.AppLeakyType.DOWNSTREAM)
 
-        # mjpeg handling pipeline
+        # MJPEG handling elements
         queue = Gst.ElementFactory.make("queue")
         parse = Gst.ElementFactory.make("jpegparse")
+        decoder = Gst.ElementFactory.make("jpegdec")
         rate = Gst.ElementFactory.make("videorate")
+        capsfilter = Gst.ElementFactory.make("capsfilter")  # will be set dynamically
         sink = Gst.ElementFactory.make("uvcsink")
 
-        # rate.set_property("max-rate", 0)
+        # Configure videorate
         rate.set_property("drop-only", True)
         rate.set_property("skip-to-first", True)
         self.rate = rate
 
+        # Queue config
         queue.set_property("notify-levels", True)
         queue.set_property("leaky", 2)
         queue.set_property("max-size-buffers", 50)
-        # queue.connect("notify::current-level-buffers", self.on_queue_current_level_buffers)
 
         if not self.appsrc or not sink:
             logging.error("failed to create mjpeg handling pipeline")
             return
 
+        # Configure uvcsink
         v4l2sink = sink.get_child_by_name("v4l2sink")
         v4l2sink.set_property("device", get_uvc_gadget_video_device())
         v4l2sink.set_property("sync", False)
         v4l2sink.set_property("async", False)
         v4l2sink.set_property("max_lateness", 0)
         v4l2sink.set_property("processing_deadline", 0)
-
         self.v4l2sink = v4l2sink
 
+        # Add all elements
         self.pipe.add(self.webrtc)
         self.pipe.add(self.appsrc)
         self.pipe.add(queue)
         self.pipe.add(parse)
+        self.pipe.add(decoder)
         self.pipe.add(rate)
+        self.pipe.add(capsfilter)
         self.pipe.add(sink)
 
+        # Link static parts
         self.appsrc.link(queue)
         queue.link(parse)
-        parse.link(rate)
-        rate.link(sink)
+        parse.link(decoder)
+        decoder.link(rate)
+        rate.link(capsfilter)
+        capsfilter.link(sink)
 
+        # Detect framerate dynamically from decoder output
+        def on_caps_probe(pad, info):
+            caps = pad.get_current_caps()
+            if caps:
+                structure = caps.get_structure(0)
+                if structure.has_field("framerate"):
+                    num, denom = structure.get_fraction("framerate")
+                    if num == 0 or denom == 0:
+                        # default to 30/1 if unknown
+                        logging.warning("Incoming MJPEG has no valid framerate, forcing 30/1")
+                        capsfilter.set_property(
+                            "caps", Gst.Caps.from_string("video/x-raw,framerate=30/1")
+                        )
+                    else:
+                        logging.info(f"Detected source framerate: {num}/{denom}")
+                        capsfilter.set_property(
+                            "caps", Gst.Caps.from_string(f"video/x-raw,framerate={num}/{denom}")
+                        )
+            return Gst.PadProbeReturn.REMOVE  # run once then remove probe
+
+        decoder.get_static_pad("src").add_probe(Gst.PadProbeType.CAPS, on_caps_probe)
+
+        # WebRTC connections
         self.webrtc.connect("pad-added", self.on_incoming_stream)
         self.webrtc.connect("pad-removed", self.on_stream_disconnect)
-
         self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
         self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
         self.webrtc.connect("on-data-channel", self.on_data_channel)
@@ -367,20 +393,16 @@ class WebRTCClient:
             "notify::ice-gathering-state", self.on_ice_gathering_state_notify
         )
 
-        # jitterbuffer latency indeed
+        # Latency tweak
         self.webrtc.set_property("latency", 0)
 
-        # Attach bus logging
+        # Bus logging
         bus = self.pipe.get_bus()
         bus.add_signal_watch()
         bus.connect("message", self.on_bus_message)
 
+        # Start pipeline
         self.pipe.set_state(Gst.State.PLAYING)
-
-        # self.webrtc.emit(
-        #     "add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, None
-        # )
-
         logging.info("pipeline started successfully!")
 
 def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
@@ -389,12 +411,6 @@ def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
         real_path = os.path.realpath(device_path)
         if usb_path in real_path:
             return "/dev/" + os.path.basename(device_path) # e.g. /dev/video0
-
-    # context = pyudev.Context()
-    # for device in context.list_devices(subsystem='video4linux'):
-    #     parent = device.find_parent('usb')
-    #     if parent and 'fe980000.usb' in parent.sys_path:
-    #         return device.device_node  # e.g. /dev/video0
     raise RuntimeError("UVC gadget video device not found.")
 
 async def handle_disconnect(websocket: websockets.server.ServerConnection):
