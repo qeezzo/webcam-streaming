@@ -37,26 +37,120 @@ class WebRTCClient:
         self.frame_count = 0
         self.timestamp = 0
 
-    def cleanup(self):
-        """Clean up resources when client disconnects"""
-        logging.info("Cleaning up WebRTC client resources")
+        self.bus = None
+        self.bus_watch_id = None
+        self.signal_ids = []     # store webrtc.connect() ids
+        self.data_channel_ids = []  # store data channel signal ids if needed
 
+    def stop_pipeline(self, wait_eos_ms=500):
+        """Properly stop and teardown the GStreamer pipeline and disconnect signals."""
+        logging.info("Stopping pipeline (stop_pipeline)")
+
+        # Try to end stream cleanly
+        try:
+            if self.appsrc:
+                try:
+                    self.appsrc.emit("end-of-stream")
+                except Exception:
+                    # some appsrc states may not accept eos; ignore
+                    pass
+        except Exception:
+            pass
+
+        # Wait shortly for EOS to propagate on the bus
+        if self.bus:
+            try:
+                # drain EOS messages up to wait_eos_ms
+                self.bus.timed_pop_filtered(wait_eos_ms * Gst.MILLISECOND, Gst.MessageType.EOS)
+            except Exception:
+                pass
+
+        # Disconnect bus handler and remove signal watch
+        if self.bus and self.bus_watch_id:
+            try:
+                self.bus.disconnect(self.bus_watch_id)
+            except Exception:
+                pass
+            try:
+                self.bus.remove_signal_watch()
+            except Exception:
+                pass
+            self.bus = None
+            self.bus_watch_id = None
+
+        # Disconnect all stored webrtc signal handlers
+        if self.webrtc:
+            for sid in self.signal_ids:
+                try:
+                    self.webrtc.disconnect(sid)
+                except Exception:
+                    pass
+            self.signal_ids = []
+
+        # If webrtc element exists, set it to NULL state first
+        try:
+            if self.webrtc:
+                self.webrtc.set_state(Gst.State.NULL)
+        except Exception:
+            pass
+
+        # Set pipeline to NULL and remove elements
         if self.pipe:
-            # EOS to the pipeline
-            self.pipe.send_event(Gst.Event.new_eos())
+            try:
+                self.pipe.set_state(Gst.State.NULL)
+            except Exception:
+                pass
 
-            # Wait for EOS to propagate
-            bus = self.pipe.get_bus()
-            if bus:
-                bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS)
+            # Remove all children from pipeline (safe even if already NULL)
+            try:
+                elems = self.pipe.iterate_elements()
+                # iterate_elements returns a Gst.Iterator — easier to just clear references by name:
+                for elem in list(self.pipe.children):
+                    try:
+                        self.pipe.remove(elem)
+                    except Exception:
+                        pass
+            except Exception:
+                # fallback if iterate_elements isn't available / different bindings
+                pass
 
-            self.pipe.set_state(Gst.State.NULL)
+            # clear Python refs so GObject can unref
             self.pipe = None
 
+        # Clear element refs
         self.webrtc = None
         self.appsrc = None
         self.data_channel = None
+        self.v4l2sink = None
+        self.rate = None
+
         self.is_active = False
+        logging.info("Pipeline stopped and torn down")
+
+    def cleanup(self):
+        logging.info("cleanup() -> delegating to stop_pipeline()")
+        self.stop_pipeline()
+
+    # def cleanup(self):
+    #     """Clean up resources when client disconnects"""
+    #     logging.info("Cleaning up WebRTC client resources")
+
+    #     if self.pipe:
+    #         # EOS to the pipeline
+    #         self.pipe.send_event(Gst.Event.new_eos())
+
+    #         # Wait for EOS to propagate
+    #         bus = self.pipe.get_bus()
+    #         if bus:
+    #             bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS)
+
+    #         self.pipe.set_state(Gst.State.NULL)
+    #         self.pipe = None
+
+    #     self.webrtc = None
+    #     self.appsrc = None
+    #     self.data_channel = None
+    #     self.is_active = False
 
     def send_soon(self, msg):
         asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
@@ -88,7 +182,7 @@ class WebRTCClient:
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
 
-            print("len -> ", len(data.get_data()))
+            # print("len -> ", len(data.get_data()))
 
             # Use wall clock time for both audio and video synchronization
             # timestamp = int(time.time() * Gst.SECOND)  # Current time in nanoseconds
@@ -179,6 +273,7 @@ class WebRTCClient:
         logging.info("sending answer back to client...")
         assert promise.wait() == Gst.PromiseResult.REPLIED
         reply = promise.get_reply()
+        print(reply.to_string())
         answer = reply.get_value("answer")
         promise = Gst.Promise.new()
         self.webrtc.emit("set-local-description", answer, promise)
@@ -292,6 +387,10 @@ class WebRTCClient:
     def start_pipeline(self):
         logging.info("creating pipeline...")
 
+        if self.pipe:
+            logging.info("existing pipeline detected, stopping first")
+            self.stop_pipeline()
+
         self.pipe = Gst.Pipeline.new("webrtc-pipeline")
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "receive")
 
@@ -352,51 +451,48 @@ class WebRTCClient:
         parse.link(rate)
         rate.link(sink)
 
-        self.webrtc.connect("pad-added", self.on_incoming_stream)
-        self.webrtc.connect("pad-removed", self.on_stream_disconnect)
-
-        self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
-        self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
-        self.webrtc.connect("on-data-channel", self.on_data_channel)
-        self.webrtc.connect("prepare-data-channel", self.prepare_data_channel)
-        self.webrtc.connect("notify::connection-state", self.on_connection_state_notify)
-        self.webrtc.connect("notify::signaling-state", self.on_signaling_state_notify)
-        self.webrtc.connect(
-            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
-        )
-
         # jitterbuffer latency indeed
         self.webrtc.set_property("latency", 0)
 
         # Attach bus logging
-        bus = self.pipe.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self.on_bus_message)
+        self.bus = self.pipe.get_bus()
+        if self.bus:
+            self.bus.add_signal_watch()
+            # store bus connect id so we can disconnect later
+            self.bus_watch_id = self.bus.connect("message", self.on_bus_message)
+
+        self.signal_ids.append(self.webrtc.connect("pad-added", self.on_incoming_stream))
+        self.signal_ids.append(self.webrtc.connect("pad-removed", self.on_stream_disconnect))
+
+        self.signal_ids.append(self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed))
+        self.signal_ids.append(self.webrtc.connect("on-ice-candidate", self.on_ice_candidate))
+        self.signal_ids.append(self.webrtc.connect("on-data-channel", self.on_data_channel))
+        self.signal_ids.append(self.webrtc.connect("prepare-data-channel", self.prepare_data_channel))
+        self.signal_ids.append(self.webrtc.connect("notify::connection-state", self.on_connection_state_notify))
+        self.signal_ids.append(self.webrtc.connect("notify::signaling-state", self.on_signaling_state_notify))
+        self.signal_ids.append(self.webrtc.connect(
+            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
+        ))
 
         self.pipe.set_state(Gst.State.PLAYING)
-
-        # self.webrtc.emit(
-        #     "add-transceiver", GstWebRTC.WebRTCRTPTransceiverDirection.RECVONLY, None
-        # )
 
         logging.info("pipeline started successfully!")
 
 
-async def handle_disconnect(websocket: websockets.server.ServerConnection):
+async def handle_disconnect(websocket: websockets.server.ServerConnection, webrtc):
     """Callback function to handle WebSocket disconnection."""
     await websocket.wait_closed()
     logging.info("handle_disconnect")
+    webrtc.cleanup()
 
 
 async def signaling(websocket: websockets.server.ServerConnection):
     logging.info("client connected")
-
-    asyncio.create_task(handle_disconnect(websocket))
-
     loop = asyncio.get_running_loop()
-
     webrtc = WebRTCClient(websocket.send, loop)
     webrtc.start_pipeline()
+
+    disconnect_task = asyncio.create_task(handle_disconnect(websocket, webrtc))
 
     try:
         async for data in websocket:
@@ -414,6 +510,15 @@ async def signaling(websocket: websockets.server.ServerConnection):
 
     except websockets.exceptions.ConnectionClosed:
         logging.info("client connection closed unexpectedly.")
+    finally:
+        # ensure disconnect task cancelled and pipeline fully torn down
+        if not disconnect_task.done():
+            disconnect_task.cancel()
+        try:
+            webrtc.stop_pipeline()
+        except Exception:
+            pass
+        logging.info("signaling finished, pipeline cleaned up.")
 
 
 async def main():
