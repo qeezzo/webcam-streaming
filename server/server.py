@@ -7,7 +7,8 @@ import json
 import time
 import asyncio
 import ssl
-
+import os
+import glob
 import gi
 
 gi.require_version("Gst", "1.0")
@@ -130,27 +131,6 @@ class WebRTCClient:
     def cleanup(self):
         logging.info("cleanup() -> delegating to stop_pipeline()")
         self.stop_pipeline()
-
-    # def cleanup(self):
-    #     """Clean up resources when client disconnects"""
-    #     logging.info("Cleaning up WebRTC client resources")
-
-    #     if self.pipe:
-    #         # EOS to the pipeline
-    #         self.pipe.send_event(Gst.Event.new_eos())
-
-    #         # Wait for EOS to propagate
-    #         bus = self.pipe.get_bus()
-    #         if bus:
-    #             bus.timed_pop_filtered(Gst.CLOCK_TIME_NONE, Gst.MessageType.EOS)
-
-    #         self.pipe.set_state(Gst.State.NULL)
-    #         self.pipe = None
-
-    #     self.webrtc = None
-    #     self.appsrc = None
-    #     self.data_channel = None
-    #     self.is_active = False
 
     def send_soon(self, msg):
         asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
@@ -431,7 +411,7 @@ class WebRTCClient:
 
         # TODO: replace hardcoded device with actual UVC
         v4l2sink = sink.get_child_by_name("v4l2sink")
-        v4l2sink.set_property("device", "/dev/video0")
+        v4l2sink.set_property("device", get_uvc_gadget_video_device())
         v4l2sink.set_property("sync", False)
         v4l2sink.set_property("async", False)
         v4l2sink.set_property("max_lateness", 0)
@@ -478,12 +458,20 @@ class WebRTCClient:
 
         logging.info("pipeline started successfully!")
 
+def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
+    for device_path in glob.glob('/sys/class/video4linux/video*'):
+        # Get the real path to resolve symbolic links
+        real_path = os.path.realpath(device_path)
+        if usb_path in real_path:
+            return "/dev/" + os.path.basename(device_path) # e.g. /dev/video0
+    raise RuntimeError("UVC gadget video device not found.")
 
-async def handle_disconnect(websocket: websockets.server.ServerConnection, webrtc):
+async def handle_disconnect(websocket: websockets.server.ServerConnection, webrtc: WebRTCClient):
     """Callback function to handle WebSocket disconnection."""
     await websocket.wait_closed()
     logging.info("handle_disconnect")
     webrtc.cleanup()
+
 
 
 async def signaling(websocket: websockets.server.ServerConnection):
@@ -515,7 +503,7 @@ async def signaling(websocket: websockets.server.ServerConnection):
         if not disconnect_task.done():
             disconnect_task.cancel()
         try:
-            webrtc.stop_pipeline()
+            webrtc.cleanup()
         except Exception:
             pass
         logging.info("signaling finished, pipeline cleaned up.")
