@@ -166,7 +166,7 @@ class WebRTCPipeline:
         for name, decodebin in list(self.decodebins.items()):
             try:
                 decodebin.set_state(Gst.State.NULL)
-            except Exception: pass
+            except Exception as e: logging.error(f"error NULLifying decodebin: {e}")
             try:
                 self.pipe.remove(decodebin)
             except Exception: pass
@@ -174,10 +174,10 @@ class WebRTCPipeline:
 
         if self.webrtc:
             try:
-                self.pipe.remove(self.webrtc)
-            except Exception: pass
+                self.webrtc.set_state(Gst.State.NULL)
+            except Exception as e: logging.error(f"error NULLifying webrtcbin: {e}")
             try:
-                self.pipe.set_state(Gst.State.NULL)
+                self.pipe.remove(self.webrtc)
             except Exception: pass
             self.webrtc = None
 
@@ -186,6 +186,8 @@ class WebRTCPipeline:
             try: self.data_channel.close()
             except Exception: pass
             self.data_channel = None
+
+        logging.info("disconnect cleanup done")
 
     def send_client(self, msg):
         if not self.send_to_client:
@@ -556,7 +558,7 @@ async def signaling(websocket: websockets.server.ServerConnection, webrtc: WebRT
     async def handle_disconnect(websocket: websockets.server.ServerConnection):
         """Callback function to handle WebSocket disconnection."""
         await websocket.wait_closed()
-        logging.info("handle_disconnect")
+        logging.info("[signaling]: handle_disconnect")
         webrtc.on_client_disconnected()
     disconnect_task = asyncio.create_task(handle_disconnect(websocket))
 
