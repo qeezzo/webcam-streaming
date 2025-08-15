@@ -24,28 +24,26 @@ gi.require_version("GstApp", "1.0")
 from gi.repository import GstApp
 
 
-class WebRTCClient:
-    def __init__(self, send_to_client, loop):
+class WebRTCPipeline:
+    def __init__(self):
         self.pipe = None
-        self.webrtc = None
         self.appsrc = None
         self.data_channel = None
 
-        self.event_loop = loop
-        self.send_to_client = send_to_client
-
-        self.last_frame_time = time.time()
+        # Single signaling connection-related fields
+        self.event_loop = None
+        self.send_to_client = None
+        self.webrtc = None
+        self.audio_stream = None # list of elements in audio chain
+        self.decodebins = {} # { pad-name: decodebin }
+        self.last_frame_time = 0
         self.frame_count = 0
-        self.timestamp = 0
 
         self.bus = None
         self.bus_watch_id = None
-        self.signal_ids = []     # store webrtc.connect() ids
-        self.data_channel_ids = []  # store data channel signal ids if needed
-
-    def stop_pipeline(self, wait_eos_ms=500):
-        """Properly stop and teardown the GStreamer pipeline and disconnect signals."""
-        logging.info("Stopping pipeline (stop_pipeline)")
+        
+    def __del__(self):
+        logging.info("cleaning up")
 
         # Try to end stream cleanly
         try:
@@ -62,7 +60,7 @@ class WebRTCClient:
         if self.bus:
             try:
                 # drain EOS messages up to wait_eos_ms
-                self.bus.timed_pop_filtered(wait_eos_ms * Gst.MILLISECOND, Gst.MessageType.EOS)
+                self.bus.timed_pop_filtered(500 * Gst.MILLISECOND, Gst.MessageType.EOS)
             except Exception:
                 pass
 
@@ -78,15 +76,6 @@ class WebRTCClient:
                 pass
             self.bus = None
             self.bus_watch_id = None
-
-        # Disconnect all stored webrtc signal handlers
-        if self.webrtc:
-            for sid in self.signal_ids:
-                try:
-                    self.webrtc.disconnect(sid)
-                except Exception:
-                    pass
-            self.signal_ids = []
 
         # If webrtc element exists, set it to NULL state first
         try:
@@ -104,7 +93,6 @@ class WebRTCClient:
 
             # Remove all children from pipeline (safe even if already NULL)
             try:
-                elems = self.pipe.iterate_elements()
                 # iterate_elements returns a Gst.Iterator — easier to just clear references by name:
                 for elem in list(self.pipe.children):
                     try:
@@ -125,14 +113,83 @@ class WebRTCClient:
         self.v4l2sink = None
         self.rate = None
 
+        self.audio_stream = None
         self.is_active = False
-        logging.info("Pipeline stopped and torn down")
+        logging.info("pipeline destroyed")
 
-    def cleanup(self):
-        logging.info("cleanup() -> delegating to stop_pipeline()")
-        self.stop_pipeline()
+    def on_client_connected(self, send_to_client, loop) -> bool:
+        logging.info("on_client_connected()")
 
-    def send_soon(self, msg):
+        if self.event_loop:
+            logging.error("on_client_connected() called while the pipeline is already in use by a client")
+            return False
+
+        self.webrtc = Gst.ElementFactory.make("webrtcbin", "receive")
+        if not self.webrtc:
+            logging.error("unable to create webrtcbin element")
+            return False
+        
+        self.event_loop = loop
+        self.send_to_client = send_to_client
+        self.last_frame_time = 0
+        self.frame_count = 0
+
+        # jitterbuffer latency
+        self.webrtc.set_property("latency", 0)
+
+        self.webrtc.connect("pad-added", self.on_incoming_stream)
+        self.webrtc.connect("pad-removed", self.on_stream_disconnect)
+        self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed)
+        self.webrtc.connect("on-ice-candidate", self.on_ice_candidate)
+        self.webrtc.connect("on-data-channel", self.on_data_channel)
+        self.webrtc.connect("prepare-data-channel", self.prepare_data_channel)
+        self.webrtc.connect("notify::connection-state", self.on_connection_state_notify)
+        self.webrtc.connect("notify::signaling-state", self.on_signaling_state_notify)
+        self.webrtc.connect(
+            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
+        )
+
+        self.pipe.add(self.webrtc)
+        self.webrtc.sync_state_with_parent()
+
+        return True
+
+    def on_client_disconnected(self):
+        logging.info("on_client_disconnected()")
+        self.event_loop = None
+        self.send_to_client = None
+
+        self.clear_audio_stream()
+
+        # on_stream_disconnected won't be called since we're destroying the webrtbin
+        # so destroy them manually
+        for name, decodebin in list(self.decodebins.items()):
+            try:
+                decodebin.set_state(Gst.State.NULL)
+            except Exception: pass
+            try:
+                self.pipe.remove(decodebin)
+            except Exception: pass
+        self.decodebins.clear()
+
+        if self.webrtc:
+            try:
+                self.pipe.remove(self.webrtc)
+            except Exception: pass
+            try:
+                self.pipe.set_state(Gst.State.NULL)
+            except Exception: pass
+            self.webrtc = None
+
+        # Disconnect peer data channel. We assume that if WS is disconnected, the client shouldn't be interacted with anymore
+        if self.data_channel:
+            try: self.data_channel.close()
+            except Exception: pass
+            self.data_channel = None
+
+    def send_client(self, msg):
+        if not self.send_to_client:
+            return
         asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
 
     def prepare_data_channel(self, _, channel, is_local):
@@ -156,41 +213,13 @@ class WebRTCClient:
 
     def on_data_channel_close(self, _):
         logging.info("data channel closed")
+        self.data_channel = None
 
     def on_data_channel_data(self, _, data):
-
         if self.appsrc:
             buf = Gst.Buffer.new_wrapped(data.get_data())
-
             # print("len -> ", len(data.get_data()))
-
-            # Use wall clock time for both audio and video synchronization
-            # timestamp = int(time.time() * Gst.SECOND)  # Current time in nanoseconds
-            # buf.pts = timestamp
-            # buf.duration = int((1 / 30) * Gst.SECOND)  # Default to 30fps
-
-            # Calculate duration based on actual frame rate
-            # if self.frame_count > 0:  # After first frame
-            #     now = time.time()
-            #     elapsed = now - self.last_frame_time
-            #     avg_frame_duration = elapsed / self.frame_count
-            #     buf.duration = int(avg_frame_duration * Gst.SECOND)
-            # else:
-
-            # clock = self.pipe.get_clock()
-            # if clock:
-            #     running_time = clock.get_time() - self.pipe.get_base_time()
-            #     buf.pts = running_time
-            #     buf.duration = Gst.CLOCK_TIME_NONE
-
-            # timestamp = Gst.util_uint64_scale(int(time.time() * Gst.SECOND), 1, 1)
-            # buf.pts = timestamp
-            # buf.duration = Gst.util_uint64_scale(1, Gst.SECOND, 30)
-
             self.appsrc.emit("push_buffer", buf)
-
-            # value_appsrc = self.appsrc.get_property("current-level-buffers")
-            # logging.info(f"APPSRC BUFFERS -> {value_appsrc}")
 
         # Track frame rate calculation
         current_time = time.time()
@@ -230,7 +259,7 @@ class WebRTCClient:
         icemsg = json.dumps(
             {"ice": {"candidate": candidate, "sdpMLineIndex": mlineindex}}
         )
-        self.send_soon(icemsg)
+        self.send_client(icemsg)
 
     def on_queue_current_level_buffers(self, queue, _):
         value = queue.get_property("current-level-buffers")
@@ -253,14 +282,14 @@ class WebRTCClient:
         logging.info("sending answer back to client...")
         assert promise.wait() == Gst.PromiseResult.REPLIED
         reply = promise.get_reply()
-        print(reply.to_string())
+        logging.info(f"Got reply: {reply.to_string()}")
         answer = reply.get_value("answer")
         promise = Gst.Promise.new()
         self.webrtc.emit("set-local-description", answer, promise)
         promise.interrupt()  # we don't care about the result, discard it
         text = answer.sdp.as_text()
         msg = json.dumps({"sdp": {"type": "answer", "sdp": text}})
-        self.send_soon(msg)
+        self.send_client(msg)
 
     def on_offer_set(self, promise, _, __):
         assert promise.wait() == Gst.PromiseResult.REPLIED
@@ -291,15 +320,12 @@ class WebRTCClient:
         caps = pad.get_current_caps()
         media_type = caps.get_structure(0).get_name()
         if media_type.startswith("video"):
-            self.handle_video_stream(pad)
+            logging.error("received stream on generic webrtc input")
         elif media_type.startswith("audio"):
             self.handle_audio_stream(pad)
         else:
             logging.warning(f"unsupported media type: {media_type}")
             return
-
-    def on_stream_disconnect(self, _, pad):
-        logging.info("on_stream_disconnect()")
 
     def on_incoming_stream(self, _, pad):
         logging.info("on_incoming_stream()")
@@ -315,17 +341,48 @@ class WebRTCClient:
         decodebin.connect("pad-added", self.on_incoming_decodebin_stream)
         self.pipe.add(decodebin)
         decodebin.sync_state_with_parent()
-        pad.link(decodebin.get_static_pad("sink"))
 
-    def handle_video_stream(self, pad):
-        """Shouldn't be any requests here. MJPEG streamed over raw data channel"""
+        if pad.link(decodebin.get_static_pad("sink")) != Gst.PadLinkReturn.OK:
+            logging.error("failed to link incoming pad to decodebin")
+            self.pipe.remove(decodebin)
+            return
+        
+        self.decodebins[pad.get_name()] = decodebin
 
-        logging.warning("received stream on generic webrtc input")
+    def on_stream_disconnect(self, _, pad):
+        logging.info("on_stream_disconnect()")
+
+        self.clear_audio_stream()
+
+        # Remove the decodebin that was fed by this pad
+        key = pad.get_name()
+        decodebin = self.decodebins.pop(key, None)
+        if decodebin:
+            try:
+                decodebin.set_state(Gst.State.NULL)
+            except Exception:
+                pass
+            try:
+                # Unlink its sink pad’s peer (incoming pad) just in case
+                sinkpad = decodebin.get_static_pad("sink")
+                if sinkpad:
+                    peer = sinkpad.get_peer()
+                    if peer:
+                        peer.unlink(sinkpad)
+            except Exception:
+                pass
+            try:
+                self.pipe.remove(decodebin)
+            except Exception:
+                pass
 
     def handle_audio_stream(self, pad):
         """Handle audio stream. Outputs direclty to an alsasink that is a UAC gadget"""
 
         logging.info("audio stream received")
+        if self.audio_stream:
+            self.clear_audio_stream()
+
         queue = Gst.ElementFactory.make("queue")
         convert = Gst.ElementFactory.make("audioconvert")
         resample = Gst.ElementFactory.make("audioresample")
@@ -334,6 +391,8 @@ class WebRTCClient:
         if not queue or not convert or not resample or not sink:
             logging.error("failed to create audio elements")
             return
+
+        self.audio_stream = [queue, convert, resample, sink]
 
         sink.set_property("device", "hw:UAC2Gadget")
         sink.set_property("sync", False)  # Crucial for low latency
@@ -346,7 +405,7 @@ class WebRTCClient:
         queue.set_property("max-size-buffers", 10)
         queue.connect(
             "notify::current-level-buffers", self.on_queue_current_level_buffers
-        )
+        )    
 
         self.pipe.add(queue)
         self.pipe.add(convert)
@@ -354,28 +413,72 @@ class WebRTCClient:
         self.pipe.add(sink)
         self.pipe.sync_children_states()
 
-        pad.link(queue.get_static_pad("sink"))
+        self.audio_upstream_pad = pad
+        self.audio_queue_sink = queue.get_static_pad("sink")
+
+        pad.link(self.audio_queue_sink)
         queue.link(convert)
         convert.link(resample)
         resample.link(sink)
 
+        for elem in self.audio_stream:
+            elem.sync_state_with_parent()
+
         logging.info("audio pipeline linked successfully")
 
-        # debug purpose
-        # Gst.debug_bin_to_dot_file(self.pipe, Gst.DebugGraphDetails.ALL, "pipeline")
+    def clear_audio_stream(self):
+        if not self.audio_stream:
+            return
+        
+        logging.info("cleaning up audio stream elements...")
 
-    def start_pipeline(self):
+        # Unlink upstream peer (incoming pad → queue.sink)
+        try:
+            if getattr(self, "audio_upstream_pad", None) and getattr(self, "audio_queue_sink", None):
+                try:
+                    self.audio_upstream_pad.unlink(self.audio_queue_sink)
+                except Exception:
+                    # some GI builds require unlink from the peer pad direction:
+                    peer = self.audio_queue_sink.get_peer()
+                    if peer:
+                        peer.unlink(self.audio_queue_sink)
+        except Exception: pass
+        self.audio_upstream_pad = None
+        self.audio_queue_sink = None
+
+        for elem in self.audio_stream:
+            try:
+                elem.set_state(Gst.State.NULL)
+            except Exception: pass
+
+        # Unlink in reverse order (sink → src)
+        try:
+            self.audio_stream[-1].unlink(self.audio_stream[-2])
+            self.audio_stream[-2].unlink(self.audio_stream[-3])
+            self.audio_stream[-3].unlink(self.audio_stream[-4])
+        except Exception as e:
+            logging.warning(f"unlink failed: {e}")
+
+        # Remove from pipeline
+        for elem in self.audio_stream:
+            try:
+                self.pipe.remove(elem)
+            except Exception as e:
+                logging.warning(f"remove failed: {e}")
+
+        self.audio_stream = None
+
+    def init_pipeline(self, uvc_gadget_device):
         logging.info("creating pipeline...")
 
         if self.pipe:
-            logging.info("existing pipeline detected, stopping first")
-            self.stop_pipeline()
+            logging.info("existing pipeline detected, nothing to do")
+            return
 
         self.pipe = Gst.Pipeline.new("webrtc-pipeline")
-        self.webrtc = Gst.ElementFactory.make("webrtcbin", "receive")
-
-        if not self.pipe or not self.webrtc:
-            logging.error("failed to create webrtc pipeline")
+        
+        if not self.pipe:
+            logging.error("failed to create webrtc-pipeline")
             return
 
         # appsrc to receive mjpeg stream from raw data channel
@@ -383,9 +486,6 @@ class WebRTCClient:
         self.appsrc.set_property("do-timestamp", True)
         self.appsrc.set_property("format", Gst.Format.TIME)
         self.appsrc.set_property("is-live", True)
-        # self.appsrc.set_property("block", True)
-        # self.appsrc.set_property("max-latency", 10)
-        # self.appsrc.set_property("min-latency", 0)
         self.appsrc.set_property("max-buffers", 5)
         self.appsrc.set_property("leaky-type", GstApp.AppLeakyType.DOWNSTREAM)
 
@@ -395,7 +495,6 @@ class WebRTCClient:
         rate = Gst.ElementFactory.make("videorate")
         sink = Gst.ElementFactory.make("uvcsink")
 
-        # rate.set_property("max-rate", 0)
         rate.set_property("drop-only", True)
         rate.set_property("skip-to-first", True)
         self.rate = rate
@@ -403,15 +502,13 @@ class WebRTCClient:
         queue.set_property("notify-levels", True)
         queue.set_property("leaky", 2)
         queue.set_property("max-size-buffers", 50)
-        # queue.connect("notify::current-level-buffers", self.on_queue_current_level_buffers)
 
         if not self.appsrc or not sink:
             logging.error("failed to create mjpeg handling pipeline")
             return
 
-        # TODO: replace hardcoded device with actual UVC
         v4l2sink = sink.get_child_by_name("v4l2sink")
-        v4l2sink.set_property("device", get_uvc_gadget_video_device())
+        v4l2sink.set_property("device", uvc_gadget_device)
         v4l2sink.set_property("sync", False)
         v4l2sink.set_property("async", False)
         v4l2sink.set_property("max_lateness", 0)
@@ -419,7 +516,6 @@ class WebRTCClient:
 
         self.v4l2sink = v4l2sink
 
-        self.pipe.add(self.webrtc)
         self.pipe.add(self.appsrc)
         self.pipe.add(queue)
         self.pipe.add(parse)
@@ -431,34 +527,17 @@ class WebRTCClient:
         parse.link(rate)
         rate.link(sink)
 
-        # jitterbuffer latency indeed
-        self.webrtc.set_property("latency", 0)
-
         # Attach bus logging
         self.bus = self.pipe.get_bus()
         if self.bus:
             self.bus.add_signal_watch()
-            # store bus connect id so we can disconnect later
             self.bus_watch_id = self.bus.connect("message", self.on_bus_message)
-
-        self.signal_ids.append(self.webrtc.connect("pad-added", self.on_incoming_stream))
-        self.signal_ids.append(self.webrtc.connect("pad-removed", self.on_stream_disconnect))
-
-        self.signal_ids.append(self.webrtc.connect("on-negotiation-needed", self.on_negotiation_needed))
-        self.signal_ids.append(self.webrtc.connect("on-ice-candidate", self.on_ice_candidate))
-        self.signal_ids.append(self.webrtc.connect("on-data-channel", self.on_data_channel))
-        self.signal_ids.append(self.webrtc.connect("prepare-data-channel", self.prepare_data_channel))
-        self.signal_ids.append(self.webrtc.connect("notify::connection-state", self.on_connection_state_notify))
-        self.signal_ids.append(self.webrtc.connect("notify::signaling-state", self.on_signaling_state_notify))
-        self.signal_ids.append(self.webrtc.connect(
-            "notify::ice-gathering-state", self.on_ice_gathering_state_notify
-        ))
 
         self.pipe.set_state(Gst.State.PLAYING)
 
         logging.info("pipeline started successfully!")
 
-def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
+def get_uvc_gadget_device(usb_path="fe980000.usb"):
     for device_path in glob.glob('/sys/class/video4linux/video*'):
         # Get the real path to resolve symbolic links
         real_path = os.path.realpath(device_path)
@@ -466,25 +545,24 @@ def get_uvc_gadget_video_device(usb_path="fe980000.usb"):
             return "/dev/" + os.path.basename(device_path) # e.g. /dev/video0
     raise RuntimeError("UVC gadget video device not found.")
 
-async def handle_disconnect(websocket: websockets.server.ServerConnection, webrtc: WebRTCClient):
-    """Callback function to handle WebSocket disconnection."""
-    await websocket.wait_closed()
-    logging.info("handle_disconnect")
-    webrtc.cleanup()
-
-
-
-async def signaling(websocket: websockets.server.ServerConnection):
-    logging.info("client connected")
+async def signaling(websocket: websockets.server.ServerConnection, webrtc: WebRTCPipeline):
+    logging.info("[signaling]: client connected")
     loop = asyncio.get_running_loop()
-    webrtc = WebRTCClient(websocket.send, loop)
-    webrtc.start_pipeline()
+    if not webrtc.on_client_connected(websocket.send, loop):
+        logging.error("[signaling]: disconnecting client")
+        websocket.close()
+        return
 
-    disconnect_task = asyncio.create_task(handle_disconnect(websocket, webrtc))
+    async def handle_disconnect(websocket: websockets.server.ServerConnection):
+        """Callback function to handle WebSocket disconnection."""
+        await websocket.wait_closed()
+        logging.info("handle_disconnect")
+        webrtc.on_client_disconnected()
+    disconnect_task = asyncio.create_task(handle_disconnect(websocket))
 
     try:
         async for data in websocket:
-            logging.info(f"client -> {data}")
+            logging.info(f"[signaling]: client -> {data}")
             msg = json.loads(data)
 
             if "sdp" in msg:
@@ -497,20 +575,24 @@ async def signaling(websocket: websockets.server.ServerConnection):
                 pass
 
     except websockets.exceptions.ConnectionClosed:
-        logging.info("client connection closed unexpectedly.")
+        logging.info("[signaling]: client connection closed unexpectedly")
     finally:
         # ensure disconnect task cancelled and pipeline fully torn down
         if not disconnect_task.done():
             disconnect_task.cancel()
         try:
-            webrtc.cleanup()
+            webrtc.on_client_disconnected()
         except Exception:
             pass
-        logging.info("signaling finished, pipeline cleaned up.")
+        logging.info("[signaling]: finished")
 
 
 async def main():
     Gst.init(None)
+
+    uvc_gadget_device = get_uvc_gadget_device()
+    webrtc = WebRTCPipeline()
+    webrtc.init_pipeline(uvc_gadget_device)
 
     # SSL Configuration using existing PiKVM certificates
     ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
@@ -526,7 +608,12 @@ async def main():
         ssl.OP_NO_SSLv2 | ssl.OP_NO_SSLv3 | ssl.OP_NO_TLSv1 | ssl.OP_NO_TLSv1_1
     )
 
-    async with websockets.serve(signaling, "0.0.0.0", 3000, ssl=ssl_context):
+    async with websockets.serve(
+            lambda websocket : signaling(websocket, webrtc),
+            "0.0.0.0",
+            3000,
+            ssl=ssl_context
+        ):
         await asyncio.Future()
 
 
