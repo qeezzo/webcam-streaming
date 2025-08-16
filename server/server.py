@@ -10,6 +10,7 @@ import ssl
 import os
 import glob
 import gi
+from gi.repository import GLib
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -35,6 +36,8 @@ class WebRTCPipeline:
         self.send_to_client = None
         self.webrtc = None
         self.audio_stream = None # list of elements in audio chain
+        self.audio_upstream_pad = None
+        self.audio_queue_sink = None
         self.decodebins = {} # { pad-name: decodebin }
         self.last_frame_time = 0
         self.frame_count = 0
@@ -42,19 +45,15 @@ class WebRTCPipeline:
         self.bus = None
         self.bus_watch_id = None
         
-    def __del__(self):
+    def cleanup(self):
         logging.info("cleaning up")
 
         # Try to end stream cleanly
-        try:
-            if self.appsrc:
-                try:
-                    self.appsrc.emit("end-of-stream")
-                except Exception:
-                    # some appsrc states may not accept eos; ignore
-                    pass
-        except Exception:
-            pass
+        if self.pipe:
+            try:
+                self.pipe.send_event(Gst.Event.new_eos())
+            except Exception as e:
+                logging.exception(f"error sending EOS to pipe: {e}")
 
         # Wait shortly for EOS to propagate on the bus
         if self.bus:
@@ -83,6 +82,8 @@ class WebRTCPipeline:
                 self.webrtc.set_state(Gst.State.NULL)
         except Exception:
             pass
+
+        self.clear_audio_stream()
 
         # Set pipeline to NULL and remove elements
         if self.pipe:
@@ -166,7 +167,7 @@ class WebRTCPipeline:
         for name, decodebin in list(self.decodebins.items()):
             try:
                 decodebin.set_state(Gst.State.NULL)
-            except Exception as e: logging.error(f"error NULLifying decodebin: {e}")
+            except Exception as e: logging.exception(f"error NULLifying decodebin: {e}")
             try:
                 self.pipe.remove(decodebin)
             except Exception: pass
@@ -175,7 +176,7 @@ class WebRTCPipeline:
         if self.webrtc:
             try:
                 self.webrtc.set_state(Gst.State.NULL)
-            except Exception as e: logging.error(f"error NULLifying webrtcbin: {e}")
+            except Exception as e: logging.exception(f"error NULLifying webrtcbin: {e}")
             try:
                 self.pipe.remove(self.webrtc)
             except Exception: pass
@@ -190,7 +191,7 @@ class WebRTCPipeline:
         logging.info("disconnect cleanup done")
 
     def send_client(self, msg):
-        if not self.send_to_client:
+        if not self.event_loop or self.event_loop.is_closed():
             return
         asyncio.run_coroutine_threadsafe(self.send_to_client(msg), self.event_loop)
 
@@ -434,26 +435,37 @@ class WebRTCPipeline:
         
         logging.info("cleaning up audio stream elements...")
 
+        if self.audio_queue_sink:
+            try:
+                logging.info("Sending EOS to audio queue")
+                self.audio_queue_sink.send_event(Gst.Event.new_eos())
+            except Exception as e:
+                logging.exception(f"error sending EOS to audio queue: {e}")
+
+        logging.info("NULLifying audio stream")
+        for elem in self.audio_stream:
+            try:
+                elem.set_state(Gst.State.NULL)
+                logging.info("Waiting for NULL")
+                elem.get_state(Gst.CLOCK_TIME_NONE)
+                logging.info("NULLified!")
+            except Exception as e: logging.exception(f"error NULLifying: {e}")
+
         # Unlink upstream peer (incoming pad → queue.sink)
         try:
-            if getattr(self, "audio_upstream_pad", None) and getattr(self, "audio_queue_sink", None):
+            if self.audio_upstream_pad and self.audio_queue_sink:
                 try:
                     self.audio_upstream_pad.unlink(self.audio_queue_sink)
                 except Exception:
                     # some GI builds require unlink from the peer pad direction:
                     peer = self.audio_queue_sink.get_peer()
-                    if peer:
-                        peer.unlink(self.audio_queue_sink)
-        except Exception: pass
+                    peer.unlink(self.audio_queue_sink)
+        except Exception as e: logging.exception(f"error unlinking queue sink: {e}")
         self.audio_upstream_pad = None
         self.audio_queue_sink = None
 
-        for elem in self.audio_stream:
-            try:
-                elem.set_state(Gst.State.NULL)
-            except Exception: pass
-
         # Unlink in reverse order (sink → src)
+        logging.info("unlinking audio stream")
         try:
             self.audio_stream[-1].unlink(self.audio_stream[-2])
             self.audio_stream[-2].unlink(self.audio_stream[-3])
@@ -462,6 +474,7 @@ class WebRTCPipeline:
             logging.warning(f"unlink failed: {e}")
 
         # Remove from pipeline
+        logging.info("removing audio from pipe")
         for elem in self.audio_stream:
             try:
                 self.pipe.remove(elem)
@@ -469,6 +482,7 @@ class WebRTCPipeline:
                 logging.warning(f"remove failed: {e}")
 
         self.audio_stream = None
+        logging.info("clear_audio_stream() done")
 
     def init_pipeline(self, uvc_gadget_device):
         logging.info("creating pipeline...")
@@ -552,7 +566,7 @@ async def signaling(websocket: websockets.server.ServerConnection, webrtc: WebRT
     loop = asyncio.get_running_loop()
     if not webrtc.on_client_connected(websocket.send, loop):
         logging.error("[signaling]: disconnecting client")
-        websocket.close()
+        await websocket.close()
         return
 
     async def handle_disconnect(websocket: websockets.server.ServerConnection):
@@ -578,15 +592,7 @@ async def signaling(websocket: websockets.server.ServerConnection, webrtc: WebRT
 
     except websockets.exceptions.ConnectionClosed:
         logging.info("[signaling]: client connection closed unexpectedly")
-    finally:
-        # ensure disconnect task cancelled and pipeline fully torn down
-        if not disconnect_task.done():
-            disconnect_task.cancel()
-        try:
-            webrtc.on_client_disconnected()
-        except Exception:
-            pass
-        logging.info("[signaling]: finished")
+    logging.info("[signaling]: finished")
 
 
 async def main():
@@ -615,8 +621,8 @@ async def main():
             "0.0.0.0",
             3000,
             ssl=ssl_context
-        ):
-        await asyncio.Future()
+        ) as server:
+        await server.serve_forever()
 
 
 if __name__ == "__main__":
